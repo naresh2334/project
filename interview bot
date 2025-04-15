@@ -1,0 +1,717 @@
+import pdfplumber
+import numpy as np
+from groq import Groq
+from typing import Dict, List, Any, Tuple
+import re
+import json
+from sentence_transformers import SentenceTransformer
+
+
+class InterviewBot:
+    def _init_(self, api_key: str, model: str = "deepseek-r1-distill-llama-70b"):
+        self.client = Groq(api_key=api_key)
+        self.model = model
+        self.resume_data = {}
+        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.conversation_history = []
+        self.interview_state = {
+            "current_topic": None,
+            "topics_covered": set(),
+            "performance_scores": {},
+            "remaining_topics": set(["projects", "internships", "skills"]),
+            "depth_levels": {"projects": 0, "internships": 0, "skills": 0},
+            "domain": None,
+            "experience_level": None,
+            "technical_difficulty": "easy",  # starts with easy questions
+            "questions_per_difficulty": {"easy": 0, "medium": 0, "hard": 0},
+            "max_questions_per_difficulty": 3,
+            "project_depth": {},  # tracks depth of questioning per project
+            "hiring_scores": {
+                "technical_knowledge": 0,
+                "problem_solving": 0,
+                "communication": 0,
+                "experience_relevance": 0
+            }
+        }
+        
+        # Domain-specific keywords for detection
+        self.domain_keywords = {
+            "data_science": ["machine learning", "data science", "AI", "deep learning", "NLP", "data analysis", 
+                           "pandas", "sklearn", "tensorflow", "pytorch", "statistics", "big data"],
+            "web_development": ["frontend", "backend", "full-stack", "javascript", "react", "angular", "vue", 
+                              "html", "css", "node.js", "express", "django", "flask"],
+            "mobile_dev": ["android", "ios", "flutter", "react native", "swift", "kotlin", "mobile app"],
+            "devops": ["devops", "cloud", "aws", "azure", "gcp", "kubernetes", "docker", "ci/cd", 
+                      "jenkins", "terraform", "infrastructure"],
+            "cybersecurity": ["security", "pentesting", "encryption", "firewall", "vulnerability", 
+                            "malware", "threat", "SIEM", "SOC"],
+            "embedded": ["embedded", "IoT", "firmware", "microcontroller", "arduino", "raspberry pi", 
+                       "rtos", "sensor", "circuit"],
+            "mechanical": ["mechanical", "cad", "autodesk", "solidworks", "thermodynamics", "fluid dynamics", 
+                         "robotics", "manufacturing", "industrial"],
+            "electrical": ["electrical", "circuits", "power systems", "control systems", "microelectronics", 
+                         "signal processing", "pcb", "vhdl", "verilog"]
+        }
+
+    def load_resume(self, resume_path: str) -> bool:
+        """Load and analyze the resume PDF."""
+        try:
+            with pdfplumber.open(resume_path) as pdf:
+                resume_text = ""
+                for page in pdf.pages:
+                    resume_text += page.extract_text()
+                
+            # Clean and analyze resume text
+            resume_text = self._preprocess_text(resume_text)
+            self.resume_data = self._analyze_resume(resume_text)
+            
+            # Determine domain and experience level
+            self._detect_domain(resume_text)
+            self._detect_experience_level(resume_text)
+            
+            print(f"\nDetected Domain: {self.interview_state['domain']}")
+            print(f"Experience Level: {self.interview_state['experience_level']}")
+            
+            return True
+        except Exception as e:
+            print(f"\nError loading resume: {str(e)}")
+            return False
+
+    def _preprocess_text(self, text: str) -> str:
+        """Clean and normalize text."""
+        text = re.sub(r'\s+', ' ', text)  # Replace multiple spaces with single space
+        text = text.strip()
+        return text
+
+    def _detect_domain(self, resume_text: str) -> None:
+        """Identify the candidate's domain based on resume content."""
+        domain_scores = {}
+        resume_lower = resume_text.lower()
+        
+        for domain, keywords in self.domain_keywords.items():
+            score = sum(resume_lower.count(keyword.lower()) for keyword in keywords)
+            domain_scores[domain] = score
+        
+        # Get domain with highest score
+        if domain_scores:
+            top_domain = max(domain_scores.items(), key=lambda x: x[1])
+            if top_domain[1] > 0:
+                self.interview_state["domain"] = top_domain[0]
+            else:
+                self.interview_state["domain"] = "general"
+        else:
+            self.interview_state["domain"] = "general"
+            
+        # Use LLM to validate and refine domain detection
+        domain_prompt = (
+            f"Based on this resume text, identify the primary technical domain of the candidate:\n\n"
+            f"{resume_text[:2000]}\n\n"  # Using first 2000 chars to stay within token limits
+            f"Choose the most appropriate domain from: data_science, web_development, mobile_dev, "
+            f"devops, cybersecurity, embedded, mechanical, electrical, or general.\n"
+            f"Return only the domain name, nothing else."
+        )
+        
+        try:
+            llm_domain = self._get_response(domain_prompt).strip().lower()
+            # If LLM provides a valid domain, update it
+            if llm_domain in self.domain_keywords or llm_domain == "general":
+                self.interview_state["domain"] = llm_domain
+        except:
+            pass  # Keep the keyword-based domain if LLM fails
+    
+    def _detect_experience_level(self, resume_text: str) -> None:
+        """Determine if the candidate is a fresher or experienced."""
+        # Look for experience indicators
+        experience_indicators = [
+            r'\b(\d+)\s*(\+)?\s*(year|yr)s?\b',  # matches "X years", "X+ years", "X yr"
+            r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec).+?(\d{4}).+?(present|current|now|till date|ongoing)\b'
+        ]
+        
+        # Default to fresher
+        self.interview_state["experience_level"] = "fresher"
+        
+        # Check for experience patterns
+        for pattern in experience_indicators:
+            matches = re.findall(pattern, resume_text.lower())
+            if matches:
+                # If years of experience are mentioned
+                if pattern == experience_indicators[0] and matches:
+                    try:
+                        years = int(matches[0][0])
+                        if years >= 1:
+                            self.interview_state["experience_level"] = "experienced"
+                            break
+                    except:
+                        pass
+                # If date ranges are mentioned
+                else:
+                    self.interview_state["experience_level"] = "experienced"
+                    break
+        
+        # Use LLM to validate and refine experience detection
+        exp_prompt = (
+            f"Based on this resume text, determine if the candidate is a 'fresher' (0-1 years of experience) "
+            f"or 'experienced' (more than 1 year of experience):\n\n"
+            f"{resume_text[:2000]}\n\n"  # Using first 2000 chars to stay within token limits
+            f"Return only 'fresher' or 'experienced', nothing else."
+        )
+        
+        try:
+            llm_exp_level = self._get_response(exp_prompt).strip().lower()
+            if llm_exp_level in ["fresher", "experienced"]:
+                self.interview_state["experience_level"] = llm_exp_level
+        except:
+            pass  # Keep the pattern-based result if LLM fails
+
+    def _analyze_resume(self, resume_text: str) -> Dict:
+        """Extract structured information from resume."""
+        analysis_prompt = (
+            f"Analyze this resume text and extract key information:\n\n{resume_text}\n\n"
+            f"Format the response as JSON with these sections:\n"
+            f"1. skills: List of technical skills with proficiency level (beginner/intermediate/advanced) when possible\n"
+            f"2. projects: List of projects with technologies used, project description, and duration\n"
+            f"3. internships: List of work experiences with company, duration, and responsibilities\n"
+            f"4. education: Educational background with degree, institution, and graduation year\n"
+            f"5. domain_specific_knowledge: Any specialized knowledge areas\n"
+            f"Each section should include detailed information for follow-up questions."
+        )
+
+        try:
+            analysis_result = self._get_response(analysis_prompt)
+            parsed_data = json.loads(analysis_result)
+            
+            # Initialize project depth tracking
+            if "projects" in parsed_data:
+                for project in parsed_data["projects"]:
+                    if isinstance(project, dict) and "name" in project:
+                        self.interview_state["project_depth"][project["name"]] = 0
+                    elif isinstance(project, str):
+                        self.interview_state["project_depth"][project] = 0
+            
+            return parsed_data
+        except Exception as e:
+            print(f"Error analyzing resume: {str(e)}")
+            return {
+                "skills": [],
+                "projects": [],
+                "internships": [],
+                "education": [],
+                "domain_specific_knowledge": []
+            }
+
+    def analyze_self_intro(self, intro_text: str) -> Dict:
+        """Analyze self-intro and identify most promising topics to explore."""
+        analysis_prompt = (
+            f"Analyze this technical self-introduction:\n\n{intro_text}\n\n"
+            f"For each topic (projects, internships, skills), evaluate:\n"
+            f"1. Technical depth mentioned (0-5)\n"
+            f"2. Uniqueness/impressiveness (0-5)\n"
+            f"3. Specific details provided (0-5)\n"
+            f"4. Most interesting technical aspects to explore\n\n"
+            f"Example interesting aspects:\n"
+            f"- For projects: Novel tech stack, complex architecture, unique challenges\n"
+            f"- For internships: Technical responsibilities, impact, technologies used\n"
+            f"- For skills: Advanced frameworks, unique combinations, practical applications\n\n"
+            f"Also extract specific project names or technologies mentioned.\n\n"
+            f"Format as JSON with:\n"
+            f"- scores: Dict with topic scores\n"
+            f"- highlights: Most technically interesting elements per topic\n"
+            f"- mentioned_projects: List of project names mentioned\n"
+            f"- key_technologies: List of specific technologies mentioned\n"
+            f"- recommended_topic: Topic with most technical depth to explore first"
+        )
+
+        try:
+            analysis_result = self._get_response(analysis_prompt)
+            analysis = json.loads(analysis_result)
+            
+            # Update interview state
+            self.interview_state["current_topic"] = analysis.get("recommended_topic", "projects")
+            for topic, score in analysis.get("scores", {}).items():
+                if score > 0:
+                    self.interview_state["topics_covered"].add(topic)
+                    self.interview_state["remaining_topics"].discard(topic)
+                    self.interview_state["depth_levels"][topic] = score
+            
+            # Track mentioned projects for depth tracking
+            if "mentioned_projects" in analysis:
+                for project in analysis["mentioned_projects"]:
+                    if project not in self.interview_state["project_depth"]:
+                        self.interview_state["project_depth"][project] = 0
+            
+            return analysis
+        except Exception as e:
+            print(f"Error analyzing intro: {str(e)}")
+            return self._fallback_intro_analysis(intro_text)
+
+    def _fallback_intro_analysis(self, intro_text: str) -> Dict:
+        """Fallback method for basic keyword analysis."""
+        analysis = {
+            "mentioned_topics": [],
+            "depth_scores": {},
+            "missing_highlights": []
+        }
+        
+        keywords = {
+            "projects": ["project", "developed", "created", "built"],
+            "internships": ["intern", "work", "experience", "company"],
+            "skills": ["skill", "technology", "programming", "framework"]
+        }
+        
+        for topic, words in keywords.items():
+            if any(word in intro_text.lower() for word in words):
+                analysis["mentioned_topics"].append(topic)
+                analysis["depth_scores"][topic] = 1
+        
+        return analysis
+
+    def determine_next_topic(self) -> Tuple[str, str]:
+        """
+        Determine the next topic to discuss based on:
+        1. What wasn't mentioned in intro
+        2. Performance scores
+        3. Natural topic progression
+        Returns topic and specific question
+        """
+        # Check if we need to increase difficulty
+        if self.interview_state["questions_per_difficulty"][self.interview_state["technical_difficulty"]] >= self.interview_state["max_questions_per_difficulty"]:
+            if self.interview_state["technical_difficulty"] == "easy":
+                self.interview_state["technical_difficulty"] = "medium"
+            elif self.interview_state["technical_difficulty"] == "medium":
+                self.interview_state["technical_difficulty"] = "hard"
+            
+            # Reset counter for the new difficulty level
+            self.interview_state["questions_per_difficulty"][self.interview_state["technical_difficulty"]] = 0
+        
+        # Avoid repeating projects with high depth
+        current_project = None
+        if self.interview_state["current_topic"] == "projects":
+            # Extract current project name if we're discussing a project
+            for hist in reversed(self.conversation_history):
+                if "project_name" in hist:
+                    current_project = hist["project_name"]
+                    break
+        
+        # If we've reached depth 2 on current project, switch to another project or topic
+        if current_project and self.interview_state["project_depth"].get(current_project, 0) >= 2:
+            # Find projects with less depth
+            low_depth_projects = [p for p, depth in self.interview_state["project_depth"].items() 
+                                if depth < 2 and p != current_project]
+            
+            if low_depth_projects:
+                # Switch to another project
+                next_project = low_depth_projects[0]
+                return self._generate_project_question(next_project)
+            else:
+                # If all projects covered in depth, move to another topic
+                if "skills" not in self.interview_state["topics_covered"]:
+                    return self._generate_initial_question("skills")
+                elif "internships" not in self.interview_state["topics_covered"]:
+                    return self._generate_initial_question("internships")
+        
+        # If no topics remaining, go deeper into best-performing area
+        if not self.interview_state["remaining_topics"]:
+            best_topic = max(self.interview_state["performance_scores"].items(), 
+                           key=lambda x: x[1])[0] if self.interview_state["performance_scores"] else "skills"
+            return self._generate_deep_dive_question(best_topic)
+        
+        # Prioritize topics not mentioned in intro
+        next_topic = next(iter(self.interview_state["remaining_topics"]))
+        return self._generate_initial_question(next_topic)
+
+    def _generate_project_question(self, project_name: str) -> Tuple[str, str]:
+        """Generate a question about a specific project."""
+        difficulty = self.interview_state["technical_difficulty"]
+        
+        difficulty_prompts = {
+            "easy": (
+                f"Generate an easy technical question about this project: '{project_name}'\n"
+                f"Focus on high-level design or technology choices that any junior developer should be able to explain.\n"
+                f"Make it conversational and brief (1-2 sentences)."
+            ),
+            "medium": (
+                f"Generate a medium-difficulty technical question about this project: '{project_name}'\n"
+                f"Focus on implementation details, challenges faced, or specific algorithms that require some experience.\n"
+                f"Make it conversational and brief (1-2 sentences)."
+            ),
+            "hard": (
+                f"Generate a challenging technical question about this project: '{project_name}'\n"
+                f"Focus on optimizations, complex technical decisions, or alternative approaches requiring expertise.\n"
+                f"Make it conversational and brief (1-2 sentences)."
+            )
+        }
+        
+        prompt = difficulty_prompts.get(difficulty, difficulty_prompts["easy"])
+        
+        try:
+            question = self._get_response(prompt)
+            # Update tracking
+            self.interview_state["project_depth"][project_name] = self.interview_state["project_depth"].get(project_name, 0) + 1
+            self.interview_state["questions_per_difficulty"][difficulty] += 1
+            
+            return ("projects", question)
+        except:
+            default_questions = {
+                "easy": f"Could you tell me about your project {project_name}?",
+                "medium": f"What technical challenges did you face in {project_name}?",
+                "hard": f"How would you redesign {project_name} if you had to start over today?"
+            }
+            return ("projects", default_questions[difficulty])
+
+    def _generate_initial_question(self, topic: str) -> Tuple[str, str]:
+        """Generate natural, focused technical questions based on intro analysis."""
+        context = self.conversation_history[0] if self.conversation_history else {}
+        intro = context.get("answer", "")
+        difficulty = self.interview_state["technical_difficulty"]
+        domain = self.interview_state["domain"]
+        
+        # Different questions based on experience level
+        experience_level = self.interview_state["experience_level"]
+        
+        # Combine these factors into a prompt
+        base_prompt = (
+            f"Based on this introduction:\n{intro}\n\n"
+            f"Generate a {difficulty}-level technical question for a {experience_level} candidate "
+            f"in the {domain} domain about their {topic}.\n"
+            f"The question should be:\n"
+            f"1. Focused on ONE specific technical aspect\n"
+            f"2. Sound like a human interviewer asking it\n"
+            f"3. Brief (max 2 sentences)\n"
+            f"4. Reference specific details they mentioned if possible\n"
+        )
+        
+        # Add difficulty-specific instructions
+        if difficulty == "easy":
+            base_prompt += "5. Focus on general knowledge and basic application\n"
+        elif difficulty == "medium":
+            base_prompt += "5. Require some problem-solving or specific implementation details\n"
+        else:  # hard
+            base_prompt += "5. Require deep technical knowledge or optimizations\n"
+            
+        # Add domain-specific examples
+        if domain == "data_science":
+            base_prompt += "Example: 'I noticed you used random forests in your project. What evaluation metrics did you use to validate your model?'\n"
+        elif domain in ["web_development", "mobile_dev"]:
+            base_prompt += "Example: 'How did you handle state management in your React application?'\n"
+        elif domain == "devops":
+            base_prompt += "Example: 'What CI/CD pipeline did you implement and why did you choose that approach?'\n"
+        else:
+            base_prompt += "Example: 'What was the most challenging technical problem you solved in this area?'\n"
+        
+        try:
+            question = self._get_response(base_prompt)
+            # Ensure question isn't too long
+            if len(question.split()) > 30:  # Limit to ~30 words
+                question = question.split('?')[0] + '?'  # Keep first question only
+                
+            # Update counter
+            self.interview_state["questions_per_difficulty"][difficulty] += 1
+            
+            # If this is a project question, try to extract the project name
+            project_name = None
+            if topic == "projects":
+                # Try to extract project name from the question
+                project_keywords = ["project", "application", "app", "system", "implementation"]
+                for keyword in project_keywords:
+                    pattern = rf"{keyword}\s+([A-Z][a-zA-Z0-9\s]+)"
+                    match = re.search(pattern, question)
+                    if match:
+                        project_name = match.group(1).strip()
+                        break
+                
+                # If a project name was found, update the project depth
+                if project_name and project_name in self.interview_state["project_depth"]:
+                    self.interview_state["project_depth"][project_name] += 1
+            
+            return (topic, question)
+        except Exception as e:
+            print(f"Error generating question: {str(e)}")
+            
+            # Default questions based on topic and difficulty
+            defaults = {
+                "projects": {
+                    "easy": "Tell me about your most recent project.",
+                    "medium": "What technical challenges did you face in your projects?",
+                    "hard": "How would you architect your project differently now?"
+                },
+                "internships": {
+                    "easy": "What was your role in your internship?",
+                    "medium": "What was the most complex problem you solved during your internship?",
+                    "hard": "How did you optimize or improve processes during your internship?"
+                },
+                "skills": {
+                    "easy": f"How did you learn {domain.replace('_', ' ')} skills?",
+                    "medium": "Which technical skill are you most proud of and why?",
+                    "hard": "How do you keep your technical skills current with industry trends?"
+                }
+            }
+            
+            return (topic, defaults.get(topic, {}).get(difficulty, f"What got you interested in {topic}?"))
+
+    def _generate_deep_dive_question(self, topic: str) -> Tuple[str, str]:
+        """Generate focused technical follow-up questions."""
+        last_response = self.conversation_history[-1]["answer"] if self.conversation_history else ""
+        difficulty = self.interview_state["technical_difficulty"]
+        domain = self.interview_state["domain"]
+        
+        follow_up_prompt = (
+            f"Based on this candidate response about {topic}:\n{last_response}\n\n"
+            f"Generate a {difficulty}-level follow-up question that:\n"
+            f"1. Digs deeper into a technical aspect they mentioned\n"
+            f"2. Challenges their understanding or asks for more specific details\n"
+            f"3. Is brief and conversational (max 2 sentences)\n"
+            f"4. Sounds like a human interviewer would ask it\n"
+            f"The candidate works in the {domain} domain and is a {self.interview_state['experience_level']}.\n"
+            f"Return only the question."
+        )
+        
+        try:
+            question = self._get_response(follow_up_prompt)
+            # Ensure question isn't too long
+            if len(question.split()) > 30:
+                question = question.split('?')[0] + '?'
+                
+            # Update counter
+            self.interview_state["questions_per_difficulty"][difficulty] += 1
+            
+            return (topic, question)
+        except:
+            # Domain-specific technical questions
+            tech_questions = {
+                "data_science": {
+                    "easy": "How did you preprocess your data?",
+                    "medium": "How did you handle class imbalance in your model?",
+                    "hard": "How would you deploy this model into production?"
+                },
+                "web_development": {
+                    "easy": "What frontend framework did you use?",
+                    "medium": "How did you optimize your application's performance?",
+                    "hard": "How would you scale this application to handle 100x more traffic?"
+                },
+                "devops": {
+                    "easy": "What CI/CD tools did you use?",
+                    "medium": "How did you handle service monitoring?",
+                    "hard": "How would you design a zero-downtime deployment strategy?"
+                },
+                "general": {
+                    "easy": "What technologies did you use?",
+                    "medium": "What was the most challenging part of this work?",
+                    "hard": "How would you improve on this if you had unlimited resources?"
+                }
+            }
+            
+            # Use domain-specific questions or fall back to general
+            domain_questions = tech_questions.get(domain, tech_questions["general"])
+            return (topic, domain_questions.get(difficulty, "Tell me more about the implementation details."))
+
+    def evaluate_response(self, topic: str, response: str) -> float:
+        """
+        Evaluate the quality of user's response on a scale of 0-1.
+        Updates the interview state with the score.
+        """
+        difficulty = self.interview_state["technical_difficulty"]
+        domain = self.interview_state["domain"]
+        
+        eval_prompt = (
+            f"Evaluate this {difficulty}-level response about {topic} for a {domain} role:\n\n{response}\n\n"
+            f"Score from 0-1 based on:\n"
+            f"1. Technical depth and accuracy (40%)\n"
+            f"2. Clear communication (30%)\n"
+            f"3. Practical experience demonstrated (30%)\n"
+            f"For the {difficulty} difficulty level, expectations are "
+            f"{'basic understanding' if difficulty == 'easy' else 'solid knowledge' if difficulty == 'medium' else 'expert knowledge'}.\n"
+            f"Return only the numeric score as a float between 0 and 1."
+        )
+        
+        try:
+            score_text = self._get_response(eval_prompt).strip()
+            # Extract number from response (in case LLM adds extra text)
+            score_match = re.search(r'0\.\d+', score_text)
+            if score_match:
+                score = float(score_match.group())
+            else:
+                score = float(score_text)
+                
+            # Bound score between 0 and 1
+            score = max(0, min(1, score))
+            self.interview_state["performance_scores"][topic] = score
+            
+            # Update hiring scores
+            if difficulty == "easy":
+                weight = 0.2
+            elif difficulty == "medium":
+                weight = 0.35
+            else:  # hard
+                weight = 0.45
+                
+            self.interview_state["hiring_scores"]["technical_knowledge"] += score * weight
+            self.interview_state["hiring_scores"]["communication"] += score * 0.3
+            self.interview_state["hiring_scores"]["experience_relevance"] += score * 0.25
+            
+            return score
+        except Exception as e:
+            print(f"Error evaluating response: {str(e)}")
+            return 0.5  # Default middle score
+
+    def continue_interview(self, user_response: str, question_count=0, max_questions=12):
+        """Continue the interview with dynamic topic selection and adaptation."""
+        if user_response.lower() in ["exit", "bye", "stop"]:
+            self._provide_feedback()
+            return
+            
+        # Check if we've reached the max questions
+        if question_count >= max_questions:
+            self._provide_feedback()
+            return
+
+        # Evaluate the response if we're in a topic
+        if self.interview_state["current_topic"]:
+            score = self.evaluate_response(self.interview_state["current_topic"], user_response)
+            
+            # Look for project name if this was a project question
+            project_name = None
+            for hist in reversed(self.conversation_history):
+                if "project_name" in hist:
+                    project_name = hist["project_name"]
+                    break
+            
+            # Store the exchange
+            exchange = {
+                "topic": self.interview_state["current_topic"],
+                "question": self.conversation_history[-1]["question"],
+                "answer": user_response,
+                "score": score,
+                "difficulty": self.interview_state["technical_difficulty"]
+            }
+            
+            if project_name:
+                exchange["project_name"] = project_name
+                
+            self.conversation_history.append(exchange)
+
+        # Determine next topic and question
+        topic, question = self.determine_next_topic()
+        self.interview_state["current_topic"] = topic
+        
+        # Store the question
+        question_data = {"topic": topic, "question": question, "difficulty": self.interview_state["technical_difficulty"]}
+        
+        # If this is about projects, try to extract project name
+        if topic == "projects":
+            for project_name in self.interview_state["project_depth"].keys():
+                if project_name.lower() in question.lower():
+                    question_data["project_name"] = project_name
+                    break
+        
+        self.conversation_history.append(question_data)
+        
+        print(f"\nModel [{self.interview_state['technical_difficulty'].upper()}]: {question}")
+        user_response = input("\nYou: ").strip()
+        self.continue_interview(user_response, question_count + 1, max_questions)
+
+    def _provide_feedback(self):
+        """Provide feedback and hiring decision at the end of the interview."""
+        # Normalize hiring scores
+        total_questions = sum(self.interview_state["questions_per_difficulty"].values())
+        if total_questions > 0:
+            for key in self.interview_state["hiring_scores"]:
+                self.interview_state["hiring_scores"][key] /= total_questions
+        
+        # Calculate overall score
+        overall_score = (
+            self.interview_state["hiring_scores"]["technical_knowledge"] * 0.4 +
+            self.interview_state["hiring_scores"]["problem_solving"] * 0.3 +
+            self.interview_state["hiring_scores"]["communication"] * 0.15 +
+            self.interview_state["hiring_scores"]["experience_relevance"] * 0.15
+        )
+        
+        # Generate feedback
+        feedback_prompt = (
+            f"Generate interview feedback for a candidate with these scores:\n"
+            f"- Technical Knowledge: {self.interview_state['hiring_scores']['technical_knowledge']:.2f}/1.0\n"
+            f"- Problem Solving: {self.interview_state['hiring_scores']['problem_solving']:.2f}/1.0\n"
+            f"- Communication: {self.interview_state['hiring_scores']['communication']:.2f}/1.0\n"
+            f"- Experience Relevance: {self.interview_state['hiring_scores']['experience_relevance']:.2f}/1.0\n"
+            f"- Overall Score: {overall_score:.2f}/1.0\n\n"
+            f"Domain: {self.interview_state['domain']}\n"
+            f"Experience Level: {self.interview_state['experience_level']}\n\n"
+            f"Provide:\n"
+            f"1. A brief summary of performance (2-3 sentences)\n"
+            f"2. 1-2 strengths with specific examples\n"
+            f"3. 1-2 areas for improvement\n"
+            f"4. A hiring decision (Hire/Consider/Reject)\n"
+            f"Keep it professional and constructive."
+        )
+        
+        try:
+            feedback = self._get_response(feedback_prompt)
+            print("\n=== Interview Completed ===\n")
+            print(f"{feedback}")
+        except Exception as e:
+            print(f"\nError generating feedback: {str(e)}")
+            print("\n=== Interview Completed ===\n")
+            print(f"Thank you for your time! Based on your performance, we'll be in touch soon.")
+
+    def start_interview(self, resume_path: str = None):
+        """Start interview with optional resume analysis."""
+        print("\n=== Welcome to Your Technical Interview! ===")
+        
+        if resume_path:
+            print("\nAnalyzing your resume...")
+            if not self.load_resume(resume_path):
+                print("Failed to load resume. Continuing without resume analysis.")
+        
+        # Customize greeting based on domain if detected
+        if self.interview_state["domain"] and self.interview_state["domain"] != "general":
+            domain_name = self.interview_state["domain"].replace("_", " ")
+            greeting = f"\nModel: Hi there! I'll be conducting your technical interview for the {domain_name} position today. Let's start with a brief introduction. Could you tell me about yourself and your experience in {domain_name}?"
+        else:
+            greeting = "\nModel: Let's start with an introduction. Tell me about your technical background and experience."
+        
+        print(greeting)
+        user_response = input("\nYou: ").strip()
+
+        # Analyze the self-introduction
+        intro_analysis = self.analyze_self_intro(user_response)
+        
+        # Store the introduction exchange
+        self.conversation_history.append({
+            "topic": "introduction",
+            "question": "Tell me about yourself.",
+            "answer": user_response
+        })
+
+        # Continue with dynamic questioning
+        self.continue_interview(user_response)
+
+    def _get_response(self, prompt: str, temperature: float = 0.7) -> str:
+        """Get a response from the LLM with error handling."""
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=1000
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"Error in API call: {str(e)}")
+            return "I apologize, but I'm having trouble processing that. Let's move on to another topic."
+
+def main():
+    # In production, load this from environment variables
+    api_key = ""
+    interviewer = InterviewBot(api_key=api_key)
+    
+    # Get resume path from user
+    print("\n=== AI Technical Interview Bot ===")
+    print("\nThis bot will conduct a technical interview based on your resume.")
+    print("The interview will adapt to your experience level and technical domain.")
+    print("It will ask progressively more challenging questions based on your responses.")
+    resume_path = input("\nPlease enter the path to your resume (PDF format) or press Enter to skip: ").strip()
+    
+    # Start interview with resume if provided
+    interviewer.start_interview(resume_path if resume_path else None)
+
+if _name_ == "_main_":
+    main()
